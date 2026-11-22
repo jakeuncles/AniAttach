@@ -1,0 +1,44 @@
+AniAttach for Daz Studio 6 - installation
+=========================================
+
+Requirements: Daz Studio 6 (6.26 or later) on Windows, 64-bit.
+
+
+Option 1: installer (recommended)
+---------------------------------
+1. Close Daz Studio.
+2. Run AniAttach-<version>-Setup.exe and follow the steps. It finds your
+   Daz Studio 6 folder by itself; you can also install into the
+   Daz Studio 6 Public Build.
+   (Windows may warn that the installer is from an unknown publisher,
+   because it is not code-signed: click "More info" > "Run anyway".)
+3. Start Daz Studio.
+
+To uninstall: Windows Settings > Apps > Installed apps > "AniAttach ... for
+Daz Studio 6" > Uninstall.
+
+
+Option 2: by hand (zip)
+-----------------------
+1. Close Daz Studio.
+2. Copy dsp_aniattach.dll into the plugins folder of Daz Studio 6, normally
+       C:\Program Files\DAZ 3D\DAZStudio6\plugins
+   (Windows asks for administrator permission to copy into Program Files.)
+3. Start Daz Studio.
+
+To uninstall: close Daz Studio and delete dsp_aniattach.dll from that folder.
+Scenes made with AniAttach still open and play the same without it.
+
+
+Check that it works
+-------------------
+- Help > About Installed Plugins lists "AniAttach" with a green status.
+- Window > Panes (Tabs) > AniAttach Timeline opens the AniAttach Timeline
+  pane. Drag its tab next to the Timeline to keep it there.
+
+
+Using AniAttach
+---------------
+Select the prop, choose the hand in the AniAttach Timeline pane, go to the
+frame where the hand touches the prop and click Pick Up Here. Go to the
+frame where it is set down and click Put Down Here. See README.md.

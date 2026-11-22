@@ -1,0 +1,5 @@
+; Daz Studio looks these up by their plain (unmangled) names.
+LIBRARY dsp_aniattach
+EXPORTS
+	getSDKVersion
+	getPluginDefinition
