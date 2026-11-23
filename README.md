@@ -99,6 +99,14 @@ plugin is back.
 - The holder's scale is not passed on to the prop.
 - Edits made while the animation plays are applied when playback stops.
 
+## Help and feedback
+Questions, problems and ideas go to [Discussions](https://github.com/jakeuncles/AniAttach/discussions):
+
+- **[Q&A](https://github.com/jakeuncles/AniAttach/discussions/categories/q-a)**: how to do something, or something that does not work. Mention your AniAttach and Daz Studio versions; the form asks for them.
+- **[Ideas](https://github.com/jakeuncles/AniAttach/discussions/categories/ideas)**: new features and changes. Upvote the ones you want.
+- **[Show and tell](https://github.com/jakeuncles/AniAttach/discussions/categories/show-and-tell)**: renders and animations made with AniAttach.
+- **[Announcements](https://github.com/jakeuncles/AniAttach/discussions/categories/announcements)**: every release is posted here; watch the repository (Custom > Discussions) to be notified.
+
 ## Releases
 
 Download the installer or the zip from the
@@ -113,7 +121,8 @@ Download the installer or the zip from the
 
 The **Release** workflow builds the plugin with the Daz Studio 6 SDK and Qt
 6.10.3, then publishes `AniAttach-x.y.z-win64.zip`, `AniAttach-x.y.z-Setup.exe`
-and `SHA256SUMS.txt` with the changelog section as release notes. Running the
+and `SHA256SUMS.txt` with the changelog section as release notes, and opens an
+Announcements discussion for it. Running the
 workflow by hand builds the same files as a run artifact without publishing.
 
 The Daz Studio 6 SDK may not be redistributed, so the workflow reads it from a
