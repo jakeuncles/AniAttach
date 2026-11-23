@@ -8,6 +8,7 @@
 
 #include "aniattachpane.h"
 
+#include <cmath>
 #include <functional>
 
 #include <QtCore/QTimer>
@@ -54,12 +55,25 @@ bool scene_usable()
 	return dzApp && !dzApp->isClosing() && dzScene;
 }
 
-void anim_range(DzTime &start, DzTime &end, DzTime &step)
+// The frames shown: the play range, like Daz's own Timeline ruler. Start and
+// end are snapped to whole frames.
+void view_range(DzTime &start, DzTime &end, DzTime &step)
 {
-	const DzTimeRange range = dzScene->getAnimRange();
+	const DzTimeRange range = dzScene->getPlayRange();
 	step = qMax<DzTime>(1, dzScene->getTimeStep());
-	start = range.getStart();
-	end = qMax(range.getEnd(), start);
+	start = (range.getStart() / step) * step;
+	end = qMax((range.getEnd() / step) * step, start);
+}
+
+// The frame (index from `start`) a time falls on. A key between two frames
+// takes effect on the next frame (AniAttach::slot_at and the bake only look
+// at whole frames).
+int frame_of(DzTime t, DzTime start, DzTime step, bool round_up)
+{
+	const DzTime d = t - start;
+	if (round_up && d > 0)
+		return int((d + step - 1) / step);
+	return int(d >= 0 ? d / step : -((-d + step - 1) / step));
 }
 
 QColor slot_color(int slot)
@@ -146,11 +160,12 @@ void DzAniAttachTimelineView::scrub_to(int x)
 	if (!scene_usable())
 		return;
 	DzTime start, end, step;
-	anim_range(start, end, step);
+	view_range(start, end, step);
 	const QRect bars = bars_rect();
 	const int frames = int((end - start) / step) + 1;
-	const double f = qBound(0.0, double(x - bars.left()) / bars.width(), 0.999999);
-	const DzTime t = start + DzTime(int(f * frames)) * step;
+	// Each frame is one cell; the click picks the cell under the mouse.
+	const int frame = qBound(0, int(std::floor(double(x - bars.left()) * frames / bars.width())), frames - 1);
+	const DzTime t = start + DzTime(frame) * step;
 	if (t != dzScene->getTime())
 		dzScene->setTime(t);
 }
@@ -164,13 +179,17 @@ void DzAniAttachTimelineView::paintEvent(QPaintEvent *)
 		return;
 
 	DzTime start, end, step;
-	anim_range(start, end, step);
+	view_range(start, end, step);
 	const QRect bars = bars_rect();
-	const DzTime span = end + step - start;
-	auto x_at = [&](DzTime t) {
-		const double f = double(qBound<DzTime>(start, t, end + step) - start) / double(span);
-		return bars.left() + f * bars.width();
-	};
+	// One cell per frame. Ticks, numbers, key diamonds and the current-frame
+	// line all sit on the middle of their frame's cell, and each cell is
+	// colored with the holder the bake uses on that frame.
+	const int frames = int((end - start) / step) + 1;
+	const double px_per_frame = double(bars.width()) / frames;
+	auto cell_left = [&](int f) { return bars.left() + f * px_per_frame; };
+	auto cell_mid = [&](int f) { return bars.left() + (f + 0.5) * px_per_frame; };
+	// The scene can sit between frames: show the frame being shown.
+	const int now_frame = frame_of(dzScene->getTime(), start, step, false);
 	const QColor text = pal.color(QPalette::Text);
 	QColor dim = text;
 	dim.setAlpha(130);
@@ -180,8 +199,6 @@ void DzAniAttachTimelineView::paintEvent(QPaintEvent *)
 	p.setPen(dim);
 	p.drawText(QRect(c_margin, 0, name_width_ - c_margin, c_ruler_h), Qt::AlignVCenter | Qt::AlignLeft, tr("Prop"));
 	p.drawText(QRect(name_width_, 0, c_now_w, c_ruler_h), Qt::AlignVCenter | Qt::AlignLeft, tr("Now held by"));
-	const int frames = int((end - start) / step) + 1;
-	const double px_per_frame = double(bars.width()) / frames;
 	int label_every = 1;
 	for (int k : {1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000})
 	{
@@ -193,13 +210,13 @@ void DzAniAttachTimelineView::paintEvent(QPaintEvent *)
 	for (int f = 0; f < frames; ++f)
 	{
 		const int frame = first_frame + f;
-		const double x = bars.left() + f * px_per_frame;
+		const double x = cell_mid(f);
 		const bool major = frame % label_every == 0;
 		if (!major && px_per_frame < 4)
 			continue;
 		p.drawLine(QPointF(x, c_ruler_h - (major ? 8 : 4)), QPointF(x, c_ruler_h - 1));
 		if (major)
-			p.drawText(QRectF(x + 2, 0, 40, c_ruler_h - 6), Qt::AlignLeft | Qt::AlignVCenter, QString::number(frame));
+			p.drawText(QRectF(x - 20, 0, 40, c_ruler_h - 7), Qt::AlignHCenter | Qt::AlignVCenter, QString::number(frame));
 	}
 
 	if (rows_.isEmpty())
@@ -210,7 +227,7 @@ void DzAniAttachTimelineView::paintEvent(QPaintEvent *)
 			   "where the hand touches it and click Pick Up Here."));
 	}
 
-	const DzTime now = dzScene->getTime();
+	const DzTime now = start + DzTime(qBound(0, now_frame, frames - 1)) * step;
 	const QColor highlight = pal.color(QPalette::Highlight);
 	const int shown = visible_rows() + 1;
 	for (int i = 0; i < shown; ++i)
@@ -257,27 +274,35 @@ void DzAniAttachTimelineView::paintEvent(QPaintEvent *)
 			p.fontMetrics().elidedText(slot_now > 0 ? AniAttach::describe(holder_now) : tr("Free"),
 				Qt::ElideRight, now_rect.width()));
 
-		// Bar: one stretch per holder.
+		// Bar: every frame colored with its holder (slot_at, the same rule
+		// as the bake), merged into runs of the same holder.
 		const QRect strip(bars.left(), y + 4, bars.width(), c_row_h - 8);
 		QPainterPath clip;
 		clip.addRoundedRect(strip, 3, 3);
 		p.save();
 		p.setClipPath(clip);
-		const QList<AniAttachSegment> segs = AniAttach::segments(node);
-		for (const AniAttachSegment &s : segs)
+		int run_start = 0;
+		int run_slot = AniAttach::slot_at(held, start);
+		for (int f = 1; f <= frames; ++f)
 		{
-			const double x0 = x_at(s.start), x1 = x_at(s.end);
+			const int s = (f < frames) ? AniAttach::slot_at(held, start + DzTime(f) * step) : -1;
+			if (s == run_slot)
+				continue;
+			const double x0 = cell_left(run_start), x1 = cell_left(f);
 			const QRectF r(x0, strip.top(), x1 - x0, strip.height());
-			QColor c = slot_color(s.slot);
-			if (s.slot <= 0)
+			QColor c = slot_color(run_slot);
+			if (run_slot <= 0)
 				c.setAlpha(120);
 			p.fillRect(r, c);
-			if (s.slot > 0 && r.width() > 30)
+			if (run_slot > 0 && r.width() > 30)
 			{
 				p.setPen(QColor(255, 255, 255));
 				p.drawText(r.adjusted(4, 0, -4, 0), Qt::AlignVCenter | Qt::AlignLeft,
-					p.fontMetrics().elidedText(short_name(s.target), Qt::ElideRight, int(r.width()) - 8));
+					p.fontMetrics().elidedText(short_name(AniAttach::target_node(node, run_slot)),
+						Qt::ElideRight, int(r.width()) - 8));
 			}
+			run_start = f;
+			run_slot = s;
 		}
 		p.restore();
 
@@ -289,13 +314,15 @@ void DzAniAttachTimelineView::paintEvent(QPaintEvent *)
 			const double cy = strip.center().y() + 0.5;
 			for (int k = 0; k < held->getNumKeys(); ++k)
 			{
-				const DzTime t = held->getKeyTime(k);
-				if (t < start || t > end)
-					continue;
 				// The first "Free" key at the start is not a real event.
-				if (k == 0 && held->getKeyValue(k) == 0 && t == start)
+				if (k == 0 && held->getKeyValue(k) == 0 && held->getKeyTime(k) <= start)
 					continue;
-				const double cx = x_at(t) + 1;
+				// A key takes effect on its frame (or the next frame when it
+				// sits between frames): draw it there.
+				const int f = frame_of(held->getKeyTime(k), start, step, true);
+				if (f < 0 || f >= frames)
+					continue;
+				const double cx = cell_mid(f);
 				QPolygonF diamond;
 				diamond << QPointF(cx, cy - 5) << QPointF(cx + 4, cy) << QPointF(cx, cy + 5) << QPointF(cx - 4, cy);
 				p.drawPolygon(diamond);
@@ -305,7 +332,9 @@ void DzAniAttachTimelineView::paintEvent(QPaintEvent *)
 	}
 
 	// Current frame.
-	const double nx = x_at(now) + 0.5 * px_per_frame;
+	if (now_frame < 0 || now_frame >= frames)
+		return; // outside the play range, like Daz's own Timeline
+	const double nx = cell_mid(now_frame);
 	p.setPen(QPen(c_now, 2));
 	p.drawLine(QPointF(nx, 0), QPointF(nx, height()));
 	p.setRenderHint(QPainter::Antialiasing, true);
@@ -478,6 +507,8 @@ void DzAniAttachPane::connect_scene()
 		<< connect(dzScene, &DzScene::sceneCleared, this, &DzAniAttachPane::schedule_rebuild)
 		<< connect(dzScene, &DzScene::timeChanged, this, &DzAniAttachPane::repaint_view)
 		<< connect(dzScene, &DzScene::animRangeChanged, this, &DzAniAttachPane::repaint_view)
+		<< connect(dzScene, &DzScene::playRangeChanged, this, &DzAniAttachPane::repaint_view)
+		<< connect(dzScene, &DzScene::timeStepChanged, this, &DzAniAttachPane::repaint_view)
 		<< connect(dzScene, &DzScene::nodeSelectionListChanged, this, &DzAniAttachPane::repaint_view)
 		<< connect(dzScene, &QObject::destroyed, this, [this]() {
 			closing_ = true;
