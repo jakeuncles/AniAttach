@@ -95,6 +95,15 @@ public:
 	// Take AniAttach off the prop: clear, then remove the carrier and the
 	// properties.
 	bool remove(DzNode *prop);
+	// Key editing from the AniAttach Timeline (each one undo step, except
+	// move_key, which the caller wraps: a drag is one undo step and bakes
+	// once the mouse is released).
+	// Key `index` of Held By: set its holder slot (0 = put down).
+	bool set_key_slot(DzNode *prop, int index, int slot);
+	bool delete_key(DzNode *prop, int index);
+	// Returns the key's new index, or -1 if another key is at `to`.
+	int  move_key(DzNode *prop, int index, DzTime to);
+
 	// Recompute the carrier keys now.
 	bool bake(DzNode *prop);
 	int  bake_all();
@@ -114,6 +123,7 @@ private:
 	void update_items(DzNode *prop);
 	void track(DzNode *prop);
 	void untrack(DzNode *prop);
+	void detach_removed(DzNode *prop);
 	void watch_chains(DzNode *prop);
 	void rescan();
 	void schedule_rescan();
@@ -133,4 +143,6 @@ private:
 	QHash<DzNode*, QList<QMetaObject::Connection>> own_connections_;
 	QHash<DzNode*, QList<QMetaObject::Connection>> chain_connections_;
 	QList<QPointer<DzNode>> tracked_;
+	// Per prop: its holders that were in the scene at the last rescan.
+	QHash<DzNode*, QList<DzNode*>> holders_seen_;
 };

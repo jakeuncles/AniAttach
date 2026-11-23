@@ -28,6 +28,7 @@ class DzAniAttachTimelineView : public QWidget {
 	Q_OBJECT
 public:
 	explicit DzAniAttachTimelineView(QWidget *parent = nullptr);
+	~DzAniAttachTimelineView() override;
 
 	void set_rows(const QList<QPointer<DzNode>> &rows);
 	void set_scroll(int first_row);
@@ -44,17 +45,30 @@ protected:
 	void mouseReleaseEvent(QMouseEvent *e) override;
 	void wheelEvent(QWheelEvent *e) override;
 	void resizeEvent(QResizeEvent *e) override;
+	void contextMenuEvent(QContextMenuEvent *e) override;
 
 private:
 	QRect bars_rect() const;
 	void layout_columns();
 	void scrub_to(int x);
 	int row_at(int y) const;
+	// The frame (index from the start of the view) under x.
+	int frame_at(int x) const;
+	DzTime time_of(int frame) const;
+	// The Held By key of row `row` drawn under `pos`, or -1.
+	int key_at(const QPoint &pos, int row) const;
+	void end_key_drag();
 
 	QList<QPointer<DzNode>> rows_;
 	int first_row_ = 0;
 	int name_width_ = 160;
 	bool scrubbing_ = false;
+
+	// Dragging a key: one undo step for the whole drag.
+	QPointer<DzNode> drag_prop_;
+	int drag_key_ = -1;
+	bool drag_moved_ = false;
+	bool drag_hold_ = false;
 };
 
 // Window > Panes (Tabs) > AniAttach Timeline. Dock it next to the Timeline.

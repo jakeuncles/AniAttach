@@ -11,6 +11,7 @@
 #include <cmath>
 
 #include <QtCore/QTimer>
+#include <QtGui/QGuiApplication>
 
 #include "dzapp.h"
 #include "dzbone.h"
@@ -40,6 +41,12 @@ const int c_bake_delay_ms = 300;
 bool scene_usable()
 {
 	return dzApp && !dzApp->isClosing() && dzScene;
+}
+
+// Daz is undoing or redoing: it puts properties, nodes and keys back itself.
+bool in_undo_redo()
+{
+	return dzUndoStack && dzUndoStack->isInUndoRedo();
 }
 
 void anim_range(DzTime &start, DzTime &end, DzTime &step)
@@ -108,7 +115,12 @@ int AniAttach::target_count(const DzNode *prop)
 DzNode *AniAttach::target_node(const DzNode *prop, int slot)
 {
 	const DzNodeProperty *p = target_property(prop, slot);
-	return p ? p->getValue() : nullptr;
+	DzNode *node = p ? p->getValue() : nullptr;
+	// A deleted holder (e.g. its figure was deleted) stays referenced, kept
+	// alive for Undo: it no longer holds anything.
+	if (node && (!dzScene || dzScene->findNodeIndex(node) < 0))
+		return nullptr;
+	return node;
 }
 
 bool AniAttach::is_carrier(const DzNode *node)
@@ -307,6 +319,7 @@ void AniAttach::hook_scene()
 	connect(dzScene, &DzScene::sceneCleared, this, [this]() {
 		tracked_.clear();
 		pending_bakes_.clear();
+		holders_seen_.clear();
 		for (auto &list : own_connections_)
 			for (const auto &c : list) QObject::disconnect(c);
 		for (auto &list : chain_connections_)
@@ -319,6 +332,17 @@ void AniAttach::hook_scene()
 		if (!pending_bakes_.isEmpty())
 			bake_timer_->start();
 	});
+	// Undo of a deleted Held By puts it back without any signal: after an
+	// Undo or Redo, look again at which props use AniAttach.
+	if (dzUndoStack)
+	{
+		auto after_undo = [this]() {
+			if (dzUndoStack->canRedo() || in_undo_redo())
+				schedule_rescan();
+		};
+		connect(dzUndoStack, &DzUndoStack::undoCaptionChanged, this, after_undo);
+		connect(dzUndoStack, &DzUndoStack::redoCaptionChanged, this, after_undo);
+	}
 	schedule_rescan();
 }
 
@@ -373,6 +397,21 @@ void AniAttach::rescan()
 			++it;
 	}
 	tracked_.removeAll(QPointer<DzNode>());
+	// Props that lost Held By (e.g. Undo of a pick-up) or left the scene.
+	for (const QPointer<DzNode> &p : QList<QPointer<DzNode>>(tracked_))
+		if (p && (!uses_aniattach(p) || dzScene->findNodeIndex(p) < 0))
+			untrack(p);
+	for (auto it = holders_seen_.begin(); it != holders_seen_.end();)
+	{
+		bool alive = false;
+		for (const QPointer<DzNode> &p : tracked_)
+			if (p == it.key())
+				alive = true;
+		if (alive)
+			++it;
+		else
+			it = holders_seen_.erase(it);
+	}
 
 	DzNodeListIterator nli = dzScene->nodeListIterator();
 	while (nli.hasNext())
@@ -382,8 +421,53 @@ void AniAttach::rescan()
 		{
 			track(node);
 			watch_chains(node);
+			// A holder was deleted (or came back with Undo): the prop no
+			// longer follows it, so its carrier keys must be baked again.
+			QList<DzNode*> present;
+			for (int slot = 1; slot <= target_count(node); ++slot)
+				present << target_node(node, slot);
+			auto seen = holders_seen_.find(node);
+			if (seen == holders_seen_.end())
+				holders_seen_.insert(node, present);
+			else if (seen.value() != present)
+			{
+				seen.value() = present;
+				update_items(node);
+				schedule_bake(node);
+			}
 		}
 	}
+	notify();
+}
+
+void AniAttach::detach_removed(DzNode *prop)
+{
+	// Held By was deleted outright (Parameters pane, a script): without it
+	// the carrier's baked keys would keep moving the prop. Finish the job
+	// like Remove AniAttach: the prop goes back where it was placed.
+	if (!scene_usable() || uses_aniattach(prop))
+		return;
+	dzUndoStack->beginHold();
+	untrack(prop);
+	holders_seen_.remove(prop);
+	baking_ = true;
+	if (DzNode *carrier = carrier_of(prop))
+	{
+		for (DzFloatProperty *c : transform_controls(carrier))
+		{
+			c->deleteAllKeys();
+			c->setValue(0.0f);
+		}
+		DzNode *parent = carrier->getNodeParent();
+		carrier->removeNodeChild(prop, false);
+		if (parent)
+			parent->addNodeChild(prop, false);
+		dzScene->removeNode(carrier);
+	}
+	for (int slot = target_count(prop); slot >= 1; --slot)
+		prop->removeProperty(target_property(prop, slot));
+	baking_ = false;
+	dzUndoStack->accept("AniAttach Remove");
 	notify();
 }
 
@@ -396,6 +480,21 @@ void AniAttach::track(DzNode *prop)
 
 	QList<QMetaObject::Connection> &conns = own_connections_[prop];
 	QPointer<DzNode> guard(prop);
+	conns << connect(prop, &DzElement::propertyRemoved, this, [this, guard](DzProperty *p) {
+		if (!guard || !p || p->getName() != held_name || !scene_usable())
+			return;
+		// Undo/Redo and loading restore everything themselves.
+		if (in_undo_redo() || dzScene->isLoading())
+		{
+			schedule_rescan();
+			return;
+		}
+		// Not from inside Daz's removal: change the scene afterwards.
+		QTimer::singleShot(0, this, [this, guard]() {
+			if (guard)
+				detach_removed(guard);
+		});
+	});
 	if (DzEnumProperty *held = held_property(prop))
 	{
 		// Keys added, moved or deleted, also from the Timeline or the
@@ -429,6 +528,7 @@ void AniAttach::untrack(DzNode *prop)
 	for (const auto &c : chain_connections_.take(prop)) QObject::disconnect(c);
 	tracked_.removeAll(QPointer<DzNode>(prop));
 	pending_bakes_.removeAll(QPointer<DzNode>(prop));
+	holders_seen_.remove(prop);
 }
 
 void AniAttach::watch_chains(DzNode *prop)
@@ -671,6 +771,64 @@ bool AniAttach::remove(DzNode *prop)
 	return true;
 }
 
+bool AniAttach::set_key_slot(DzNode *prop, int index, int slot)
+{
+	DzEnumProperty *held = held_property(prop);
+	if (!scene_usable() || !held || index < 0 || index >= held->getNumKeys()
+		|| slot < 0 || slot > target_count(prop))
+		return false;
+	if (held->getKeyValue(index) == slot)
+		return true;
+	dzUndoStack->beginHold();
+	baking_ = true;
+	held->setKeyValue(index, slot);
+	baking_ = false;
+	bake_now(prop);
+	dzUndoStack->accept(slot ? "AniAttach Pick Up" : "AniAttach Put Down");
+	notify();
+	return true;
+}
+
+bool AniAttach::delete_key(DzNode *prop, int index)
+{
+	DzEnumProperty *held = held_property(prop);
+	if (!scene_usable() || !held || index < 0 || index >= held->getNumKeys())
+		return false;
+	dzUndoStack->beginHold();
+	baking_ = true;
+	held->deleteKeys(index, index);
+	if (held->getNumKeys() == 0)
+		held->setValue(0);
+	baking_ = false;
+	bake_now(prop);
+	dzUndoStack->accept("AniAttach Delete Key");
+	notify();
+	return true;
+}
+
+int AniAttach::move_key(DzNode *prop, int index, DzTime to)
+{
+	DzEnumProperty *held = held_property(prop);
+	if (!scene_usable() || !held || index < 0 || index >= held->getNumKeys())
+		return -1;
+	if (held->getKeyTime(index) == to)
+		return index;
+	int existing = -1;
+	if (held->isKey(to, existing))
+		return -1;
+	const int slot = held->getKeyValue(index);
+	// Not baking_: the change schedules a bake, which waits for the mouse
+	// button to be released.
+	held->deleteKeys(index, index);
+	held->setValue(to, slot);
+	for (int k = 0; k < held->getNumKeys(); ++k)
+		held->setKeyInterpolationType(k, DzProperty::InterpConstant);
+	int moved = -1;
+	held->isKey(to, moved);
+	notify();
+	return moved;
+}
+
 bool AniAttach::bake(DzNode *prop)
 {
 	return bake_now(prop);
@@ -703,6 +861,14 @@ void AniAttach::run_scheduled_bakes()
 	{
 		if (!dzScene->isPlaying())
 			bake_timer_->start();
+		return;
+	}
+	// A slider or manipulator is still being dragged (posing the arm, moving
+	// the table): every mouse move changes keys. Bake once, after the
+	// mouse button is released, instead of in the middle of the drag.
+	if (QGuiApplication::mouseButtons() != Qt::NoButton)
+	{
+		bake_timer_->start();
 		return;
 	}
 	const QList<QPointer<DzNode>> props = pending_bakes_;
@@ -753,7 +919,6 @@ bool AniAttach::bake_now(DzNode *prop)
 
 	DzTime start, end, step;
 	anim_range(start, end, step);
-	const DzTime original_time = dzScene->getTime();
 	DzNode *parent = carrier->getNodeParent();
 
 	const DzTime t0 = segs.at(first).start;
@@ -769,8 +934,11 @@ bool AniAttach::bake_now(DzNode *prop)
 	// Full world matrices (Daz: row vectors, child world = local * parent
 	// world): a bone's matrix also carries its centre point and orientation,
 	// which its position and rotation alone do not.
-	dzScene->setTime(t);
-	DzMatrix3 prev = carrier->getWSTransform();
+	// Every transform is read at its frame (getWSTransform(t)) instead of
+	// moving the scene there: setTime() makes Daz evaluate the whole scene
+	// (every figure, the viewport, other plugins) for each frame, which made
+	// one bake of a 300-frame scene take seconds.
+	DzMatrix3 prev = carrier->getWSTransform(t);
 	if (t < t0)
 		t += step;
 
@@ -789,7 +957,6 @@ bool AniAttach::bake_now(DzNode *prop)
 
 	for (; t <= end; t += step)
 	{
-		dzScene->setTime(t);
 		while (seg_index + 1 < segs.size() && segs.at(seg_index + 1).start <= t)
 			++seg_index;
 		const AniAttachSegment &seg = segs.at(seg_index);
@@ -803,7 +970,7 @@ bool AniAttach::bake_now(DzNode *prop)
 			{
 				// Picked up (or handed over): keep where it is relative to
 				// the new holder.
-				grip = prev * target->getWSTransform().inverse();
+				grip = prev * target->getWSTransform(t).inverse();
 				holder = target;
 				mode = Held;
 			}
@@ -816,9 +983,9 @@ bool AniAttach::bake_now(DzNode *prop)
 
 		DzMatrix3 world;
 		bool write = true;
-		const DzMatrix3 parent_now = parent ? parent->getWSTransform() : DzMatrix3(true);
+		const DzMatrix3 parent_now = parent ? parent->getWSTransform(t) : DzMatrix3(true);
 		if (mode == Held)
-			world = grip * holder->getWSTransform();
+			world = grip * holder->getWSTransform(t);
 		else
 		{
 			world = placed;
@@ -829,7 +996,7 @@ bool AniAttach::bake_now(DzNode *prop)
 		}
 		prev_parent = parent_now;
 		if (write)
-			carrier->setWSTransform(t, world.row(3), DzQuat(world), carrier->getWSScale());
+			carrier->setWSTransform(t, world.row(3), DzQuat(world), carrier->getWSScale(t));
 		prev = world;
 	}
 
@@ -854,7 +1021,6 @@ bool AniAttach::bake_now(DzNode *prop)
 		}
 	}
 
-	dzScene->setTime(original_time);
 	baking_ = false;
 	watch_chains(prop);
 	notify();

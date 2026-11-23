@@ -12,6 +12,7 @@
 #include <functional>
 
 #include <QtCore/QTimer>
+#include <QtGui/QContextMenuEvent>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainter>
 #include <QtGui/QPainterPath>
@@ -19,6 +20,7 @@
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLabel>
+#include <QtWidgets/QMenu>
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QScrollBar>
 #include <QtWidgets/QVBoxLayout>
@@ -29,6 +31,7 @@
 #include "dznode.h"
 #include "dzscene.h"
 #include "dztimerange.h"
+#include "dzundostack.h"
 
 #include "aniattachcore.h"
 
@@ -103,7 +106,83 @@ DzAniAttachTimelineView::DzAniAttachTimelineView(QWidget *parent) :
 	QWidget(parent)
 {
 	setMinimumHeight(c_ruler_h + 2 * c_row_h);
+	setMouseTracking(true); // a sideways cursor over keys: they can be dragged
 	setFocusPolicy(Qt::NoFocus);
+}
+
+DzAniAttachTimelineView::~DzAniAttachTimelineView()
+{
+	end_key_drag();
+}
+
+int DzAniAttachTimelineView::frame_at(int x) const
+{
+	DzTime start, end, step;
+	view_range(start, end, step);
+	const QRect bars = bars_rect();
+	const int frames = int((end - start) / step) + 1;
+	// Each frame is one cell; this is the cell under x.
+	return qBound(0, int(std::floor(double(x - bars.left()) * frames / bars.width())), frames - 1);
+}
+
+DzTime DzAniAttachTimelineView::time_of(int frame) const
+{
+	DzTime start, end, step;
+	view_range(start, end, step);
+	return start + DzTime(frame) * step;
+}
+
+int DzAniAttachTimelineView::key_at(const QPoint &pos, int row) const
+{
+	DzNode *node = (row >= 0 && row < rows_.size()) ? rows_.at(row).data() : nullptr;
+	const DzEnumProperty *held = AniAttach::held_property(node);
+	if (!held || !scene_usable() || pos.x() < bars_rect().left())
+		return -1;
+	DzTime start, end, step;
+	view_range(start, end, step);
+	const QRect bars = bars_rect();
+	const int frames = int((end - start) / step) + 1;
+	const double px_per_frame = double(bars.width()) / frames;
+	const double reach = qMax(5.0, px_per_frame / 2);
+	int best = -1;
+	double best_d = reach + 1;
+	for (int k = 0; k < held->getNumKeys(); ++k)
+	{
+		// The first "Free" key at the start is not drawn: not a real event.
+		if (k == 0 && held->getKeyValue(k) == 0 && held->getKeyTime(k) <= start)
+			continue;
+		const int f = frame_of(held->getKeyTime(k), start, step, true);
+		if (f < 0 || f >= frames)
+			continue;
+		const double d = std::abs(bars.left() + (f + 0.5) * px_per_frame - pos.x());
+		if (d <= reach && d < best_d)
+		{
+			best = k;
+			best_d = d;
+		}
+	}
+	return best;
+}
+
+void DzAniAttachTimelineView::end_key_drag()
+{
+	if (drag_hold_ && scene_usable() && dzUndoStack)
+	{
+		if (drag_moved_)
+		{
+			// Bake now, inside the same undo step as the move.
+			if (drag_prop_)
+				core()->bake(drag_prop_);
+			dzUndoStack->accept(tr("AniAttach Move Key"));
+		}
+		else
+			dzUndoStack->drop();
+	}
+	drag_hold_ = false;
+	drag_moved_ = false;
+	drag_key_ = -1;
+	drag_prop_ = nullptr;
+	update();
 }
 
 void DzAniAttachTimelineView::set_rows(const QList<QPointer<DzNode>> &rows)
@@ -159,13 +238,7 @@ void DzAniAttachTimelineView::scrub_to(int x)
 {
 	if (!scene_usable())
 		return;
-	DzTime start, end, step;
-	view_range(start, end, step);
-	const QRect bars = bars_rect();
-	const int frames = int((end - start) / step) + 1;
-	// Each frame is one cell; the click picks the cell under the mouse.
-	const int frame = qBound(0, int(std::floor(double(x - bars.left()) * frames / bars.width())), frames - 1);
-	const DzTime t = start + DzTime(frame) * step;
+	const DzTime t = time_of(frame_at(x));
 	if (t != dzScene->getTime())
 		dzScene->setTime(t);
 }
@@ -323,9 +396,23 @@ void DzAniAttachTimelineView::paintEvent(QPaintEvent *)
 				if (f < 0 || f >= frames)
 					continue;
 				const double cx = cell_mid(f);
+				const bool dragged = drag_hold_ && node == drag_prop_ && k == drag_key_;
+				const double r = dragged ? 7 : 5;
 				QPolygonF diamond;
-				diamond << QPointF(cx, cy - 5) << QPointF(cx + 4, cy) << QPointF(cx, cy + 5) << QPointF(cx - 4, cy);
-				p.drawPolygon(diamond);
+				diamond << QPointF(cx, cy - r) << QPointF(cx + r - 1, cy) << QPointF(cx, cy + r) << QPointF(cx - r + 1, cy);
+				if (dragged)
+				{
+					p.setBrush(c_now);
+					p.drawPolygon(diamond);
+					// The frame it will land on.
+					p.setPen(text);
+					p.drawText(QRectF(cx + 8, y, 60, c_row_h), Qt::AlignVCenter | Qt::AlignLeft,
+						QString::number(first_frame + f));
+					p.setPen(QPen(QColor(40, 40, 40), 1));
+					p.setBrush(c_key);
+				}
+				else
+					p.drawPolygon(diamond);
 			}
 		}
 		p.setRenderHint(QPainter::Antialiasing, false);
@@ -350,6 +437,20 @@ void DzAniAttachTimelineView::mousePressEvent(QMouseEvent *e)
 	if (e->button() != Qt::LeftButton || !scene_usable())
 		return;
 	const QPoint pos = e->position().toPoint();
+	const int key_row = row_at(pos.y());
+	const int key = key_at(pos, key_row);
+	if (key >= 0 && dzUndoStack)
+	{
+		// Press on a key: drag it (one undo step). Without moving, the click
+		// only goes to its frame.
+		drag_prop_ = rows_.at(key_row).data();
+		drag_key_ = key;
+		drag_moved_ = false;
+		drag_hold_ = true;
+		dzUndoStack->beginHold();
+		update();
+		return;
+	}
 	if (pos.x() >= name_width_)
 	{
 		scrubbing_ = true;
@@ -371,13 +472,153 @@ void DzAniAttachTimelineView::mousePressEvent(QMouseEvent *e)
 
 void DzAniAttachTimelineView::mouseMoveEvent(QMouseEvent *e)
 {
+	const QPoint pos = e->position().toPoint();
+	if (drag_hold_)
+	{
+		DzNode *prop = drag_prop_.data();
+		const DzEnumProperty *held = AniAttach::held_property(prop);
+		if (!prop || !held || !scene_usable() || drag_key_ >= held->getNumKeys())
+		{
+			end_key_drag();
+			return;
+		}
+		const DzTime to = time_of(frame_at(pos.x()));
+		if (to != held->getKeyTime(drag_key_))
+		{
+			// A frame that already has a key is skipped: the key stays put.
+			const int moved = core()->move_key(prop, drag_key_, to);
+			if (moved >= 0)
+			{
+				drag_key_ = moved;
+				drag_moved_ = true;
+				update();
+			}
+		}
+		return;
+	}
 	if (scrubbing_)
-		scrub_to(e->position().toPoint().x());
+	{
+		scrub_to(pos.x());
+		return;
+	}
+	setCursor(key_at(pos, row_at(pos.y())) >= 0 ? Qt::SizeHorCursor : Qt::ArrowCursor);
 }
 
-void DzAniAttachTimelineView::mouseReleaseEvent(QMouseEvent *)
+void DzAniAttachTimelineView::mouseReleaseEvent(QMouseEvent *e)
 {
 	scrubbing_ = false;
+	if (!drag_hold_)
+		return;
+	const bool moved = drag_moved_;
+	end_key_drag();
+	if (!moved && scene_usable())
+		scrub_to(e->position().toPoint().x()); // a click on a key: go to its frame
+}
+
+void DzAniAttachTimelineView::contextMenuEvent(QContextMenuEvent *e)
+{
+	if (!scene_usable() || drag_hold_)
+		return;
+	const QPoint pos = e->pos();
+	const int row = row_at(pos.y());
+	DzNode *prop = row >= 0 ? rows_.at(row).data() : nullptr;
+	const bool on_timeline = pos.x() >= bars_rect().left();
+	const int frame = frame_at(pos.x());
+	const DzTime time = time_of(frame);
+	DzTime start, end, step;
+	view_range(start, end, step);
+	const int frame_no = int(start / step) + frame;
+	const int key = key_at(pos, row);
+
+	QMenu menu(this);
+	QPointer<DzNode> guard(prop);
+	const DzEnumProperty *held = AniAttach::held_property(prop);
+
+	if (key >= 0 && held)
+	{
+		const int key_frame = frame_of(held->getKeyTime(key), start, step, true) + int(start / step);
+		const int slot = held->getKeyValue(key);
+		menu.addSection(tr("Key at frame %1").arg(key_frame));
+		QAction *free = menu.addAction(tr("Put Down (Free)"));
+		free->setCheckable(true);
+		free->setChecked(slot == 0);
+		connect(free, &QAction::triggered, this, [guard, key]() {
+			if (guard && scene_usable()) core()->set_key_slot(guard, key, 0);
+		});
+		for (int s = 1; s <= AniAttach::target_count(prop); ++s)
+		{
+			DzNode *t = AniAttach::target_node(prop, s);
+			if (!t)
+				continue;
+			QAction *a = menu.addAction(tr("Held by %1").arg(AniAttach::describe(t)));
+			a->setCheckable(true);
+			a->setChecked(slot == s);
+			connect(a, &QAction::triggered, this, [guard, key, s]() {
+				if (guard && scene_usable()) core()->set_key_slot(guard, key, s);
+			});
+		}
+		menu.addSeparator();
+		connect(menu.addAction(tr("Delete Key")), &QAction::triggered, this, [guard, key]() {
+			if (guard && scene_usable()) core()->delete_key(guard, key);
+		});
+		const DzTime key_time = start + DzTime(frame_of(held->getKeyTime(key), start, step, true)) * step;
+		connect(menu.addAction(tr("Go to Frame %1").arg(key_frame)), &QAction::triggered, this, [key_time]() {
+			if (scene_usable()) dzScene->setTime(key_time);
+		});
+	}
+	else if (on_timeline)
+	{
+		if (prop)
+		{
+			menu.addSection(prop->getLabel());
+			// Holders: the figures' hands, plus anything that held it before.
+			QList<DzNode*> holders = AniAttach::hands();
+			for (int s = 1; s <= AniAttach::target_count(prop); ++s)
+				if (DzNode *t = AniAttach::target_node(prop, s))
+					if (!holders.contains(t))
+						holders.append(t);
+			QMenu *pick = menu.addMenu(tr("Pick Up at Frame %1 by").arg(frame_no));
+			for (DzNode *h : holders)
+			{
+				QPointer<DzNode> hg(h);
+				connect(pick->addAction(AniAttach::describe(h)), &QAction::triggered, this, [guard, hg, time]() {
+					if (guard && hg && scene_usable()) core()->attach(guard, hg, time);
+				});
+			}
+			pick->setEnabled(!holders.isEmpty());
+			QAction *put = menu.addAction(tr("Put Down at Frame %1").arg(frame_no));
+			put->setEnabled(AniAttach::has_holds(held));
+			connect(put, &QAction::triggered, this, [guard, time]() {
+				if (guard && scene_usable()) core()->release(guard, time);
+			});
+		}
+		connect(menu.addAction(tr("Go to Frame %1").arg(frame_no)), &QAction::triggered, this, [time]() {
+			if (scene_usable()) dzScene->setTime(time);
+		});
+	}
+
+	if (prop)
+	{
+		menu.addSeparator();
+		connect(menu.addAction(tr("Select %1").arg(prop->getLabel())), &QAction::triggered, this, [guard]() {
+			if (!guard || !scene_usable()) return;
+			dzScene->selectAllNodes(false);
+			guard->select(true);
+		});
+		connect(menu.addAction(tr("Clear Pick-Ups")), &QAction::triggered, this, [guard]() {
+			if (guard && scene_usable()) core()->clear(guard);
+		});
+		connect(menu.addAction(tr("Rebake")), &QAction::triggered, this, [guard]() {
+			if (guard && scene_usable()) core()->bake(guard);
+		});
+		connect(menu.addAction(tr("Remove AniAttach")), &QAction::triggered, this, [guard]() {
+			if (guard && scene_usable()) core()->remove(guard);
+		});
+	}
+
+	if (!menu.isEmpty())
+		menu.exec(e->globalPos());
+	e->accept();
 }
 
 void DzAniAttachTimelineView::wheelEvent(QWheelEvent *e)
@@ -585,7 +826,8 @@ void DzAniAttachPane::rebuild()
 			"touches it and click Pick Up Here. Later, at the frame where it is set down, click Put Down Here."));
 	else
 		summary_->setText(tr("%1 prop(s) with AniAttach, %2 picked up at some point. "
-			"Click or drag the bars to move the timeline.").arg(rows.size()).arg(held));
+			"Click or drag the bars to move the timeline, drag a key to move it, right-click for more.")
+			.arg(rows.size()).arg(held));
 }
 
 void DzAniAttachPane::rebuild_holders()

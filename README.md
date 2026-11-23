@@ -9,7 +9,7 @@ Daz Studio cannot animate a node's parent, so "parent the cup to the hand at
 frame 30, unparent it at frame 80" is not possible on its own. AniAttach
 does it for you with ordinary keys.
 
-Version 1.0 · Daz Studio 6.26 or later · Windows 64-bit
+Version 1.1 · Daz Studio 6.26 or later · Windows 64-bit
 
 ## To use
 
@@ -56,6 +56,15 @@ One row per prop that uses AniAttach:
 - **Now held by**: who holds it at the current frame
 
 Click a name to select the prop (Ctrl+click to add to the selection).
+
+Drag a yellow diamond to move that pick-up or put-down to another frame
+(frames that already have a key are skipped); click it to go to its frame.
+The prop is rebaked when you let go, and Edit > Undo undoes the whole drag.
+
+Right-click for more: on a key, choose who holds the prop from there
+(**Held by ...**) or **Put Down (Free)**, **Delete Key** or **Go to Frame**;
+on a bar, **Pick Up at Frame N by** any hand, or **Put Down at Frame N**; on
+any row, **Select**, **Clear Pick-Ups**, **Rebake** and **Remove AniAttach**.
 
 ## How it works
 
