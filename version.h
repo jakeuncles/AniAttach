@@ -10,7 +10,7 @@
 #include "dzversion.h"
 
 #define ANIATTACH_MAJOR	1
-#define ANIATTACH_MINOR	1
+#define ANIATTACH_MINOR	2
 #define ANIATTACH_REV	0
 #define ANIATTACH_BUILD	1
 

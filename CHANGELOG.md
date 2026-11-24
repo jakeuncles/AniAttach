@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0
+- Less lag while you work: AniAttach no longer looks through every node of the scene (a node per bone, hundreds per figure) after every undoable action anywhere in Daz. AniAttach props are now tagged (a hidden "AniAttach Prop" property, saved with the scene) and kept in a registry; only the nodes a file or a paste adds are checked, once, and bones are skipped. The watchers on a holder's arm are only rewired when a holder changes, not on every update.
+- Fixed props that drifted out of the hand (by up to 40 cm in a test) when the arm is animated with pose controls such as "Arms Up-Down": 1.1's faster updates read positions in a way that ignores pose controls. AniAttach now detects pose-control (and other driven) animation on the holder and uses the exact method there, and spot-checks the fast method everywhere else. Bone-keyed animation keeps the fast path (600 frames: about 20 ms; with pose controls: about 0.5 s).
+- Editing a pose control that moves a holder now updates the prop by itself, like editing the bones.
+- Props from 1.0/1.1 scenes get the tag at their next AniAttach edit (opening a scene does not change it).
+
 ## 1.1.0
 - AniAttach Timeline: drag a pick-up or put-down key to another frame; click a key to go to its frame. Right-click a key to change who holds the prop from there (or put it down), delete it or go to it; right-click a bar to pick the prop up at that frame with any hand, or put it down there; right-click any row to select, clear, rebake or remove.
 - Fixed a prop that kept moving with its old animation after its Held By property was deleted outright (e.g. from the Parameters pane). AniAttach now finishes the removal: the prop goes back where it was placed and its carrier is removed.

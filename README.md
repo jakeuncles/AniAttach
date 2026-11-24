@@ -79,9 +79,13 @@ A prop that uses AniAttach gets:
   *carrier*. AniAttach keys the carrier on every frame where the prop is held,
   and at the start and end of every stretch where it is put down. Don't edit
   the carrier's keys: they are recomputed.
+- A hidden **AniAttach Prop** tag. AniAttach keeps a list of the tagged props
+  and only ever looks at those, so the rest of the scene (every figure's
+  bones, other props) costs nothing while you work.
 
 The carrier's motion is computed from the holders' full world matrices, so a
-held prop moves exactly like a child parented to the hand.
+held prop moves exactly like a child parented to the hand. Arm animation
+made with pose controls (such as *Arms Up-Down*) is followed too.
 
 ## Saving, loading and sharing
 

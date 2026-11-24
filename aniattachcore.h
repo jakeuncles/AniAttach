@@ -32,6 +32,7 @@
 #include <QtCore/QMetaObject>
 #include <QtCore/QObject>
 #include <QtCore/QPointer>
+#include <QtCore/QSet>
 #include "dztypes.h"
 
 class QTimer;
@@ -57,6 +58,7 @@ public:
 	static const char *held_name;     // "AniAttachHeld"
 	static const char *target_prefix; // "AniAttachTarget"
 	static const char *carrier_mark;  // "AniAttachCarrier"
+	static const char *prop_mark;     // "AniAttachProp": tags a prop that uses AniAttach
 
 	// --- reading ---------------------------------------------------------
 	static DzEnumProperty *held_property(const DzNode *prop);
@@ -108,7 +110,10 @@ public:
 	bool bake(DzNode *prop);
 	int  bake_all();
 
+	// The registered AniAttach props, from the registry: no scene scan.
 	QList<DzNode*> props() const;
+	// Is `node` a registered AniAttach prop? O(1).
+	bool is_registered(const DzNode *node) const;
 
 signals:
 	// Something to redraw: keys, targets, props added or removed.
@@ -119,14 +124,22 @@ private:
 	void hook_scene();
 	void notify();
 	DzEnumProperty *ensure_setup(DzNode *prop);
+	void ensure_tag(DzNode *prop);
 	int  slot_for(DzNode *prop, DzNode *target);
 	void update_items(DzNode *prop);
 	void track(DzNode *prop);
 	void untrack(DzNode *prop);
 	void detach_removed(DzNode *prop);
 	void watch_chains(DzNode *prop);
+	QList<DzNode*> movers_of(DzNode *prop) const;
+	// Is anything moving `nodes` driven by animated controllers (pose
+	// controls through ERC, formulas)? Then reading a transform at a time
+	// is wrong and the bake must move the scene to each frame.
+	static bool driven_by_animation(const QList<DzNode*> &nodes);
 	void rescan();
 	void schedule_rescan();
+	void on_node_added(DzNode *node);
+	void on_node_removed(DzNode *node);
 	void key_held(DzEnumProperty *held, DzTime time, int slot);
 	void schedule_bake(DzNode *prop);
 	void run_scheduled_bakes();
@@ -142,7 +155,19 @@ private:
 	// moves it (holders and their parents, the carrier's parents).
 	QHash<DzNode*, QList<QMetaObject::Connection>> own_connections_;
 	QHash<DzNode*, QList<QMetaObject::Connection>> chain_connections_;
+	// The registry: every AniAttach prop in the scene. Filled when a prop is
+	// picked up, and from the nodes a file adds (checked once each, bones
+	// skipped). Nothing ever walks the whole scene except once at startup.
 	QList<QPointer<DzNode>> tracked_;
+	QSet<const DzNode*> registry_;
+	// Props that left the registry (removed, Held By deleted, Undo of a
+	// pick-up): Undo/Redo can bring them back.
+	QList<QPointer<DzNode>> former_;
+	// Nodes a file or a paste added, checked at the next rescan.
+	QList<QPointer<DzNode>> pending_added_;
+	bool initial_scan_done_ = false;
 	// Per prop: its holders that were in the scene at the last rescan.
 	QHash<DzNode*, QList<DzNode*>> holders_seen_;
+	// Per prop: the nodes its chain connections watch (rewire only on change).
+	QHash<DzNode*, QList<DzNode*>> movers_;
 };

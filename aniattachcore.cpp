@@ -9,6 +9,7 @@
 #include "aniattachcore.h"
 
 #include <cmath>
+#include <functional>
 
 #include <QtCore/QTimer>
 #include <QtGui/QGuiApplication>
@@ -17,6 +18,8 @@
 #include "dzbone.h"
 #include "dzboolproperty.h"
 #include "dzenumproperty.h"
+#include "dzerclink.h"
+#include "dznumericproperty.h"
 #include "dzfloatproperty.h"
 #include "dzmatrix3.h"
 #include "dznode.h"
@@ -31,6 +34,7 @@
 const char *AniAttach::held_name = "AniAttachHeld";
 const char *AniAttach::target_prefix = "AniAttachTarget";
 const char *AniAttach::carrier_mark = "AniAttachCarrier";
+const char *AniAttach::prop_mark = "AniAttachProp";
 
 namespace {
 
@@ -139,6 +143,10 @@ bool AniAttach::is_candidate(const DzNode *node)
 	return node && !qobject_cast<const DzBone*>(node) && !is_carrier(node);
 }
 
+// Held By is what AniAttach works from. Props also get the "AniAttach Prop"
+// tag since 1.2 (scenes from 1.0/1.1 have Held By only, so that is what
+// counts). Only registered props and just-added nodes are ever asked this;
+// everything else uses the registry (is_registered).
 bool AniAttach::uses_aniattach(const DzNode *node)
 {
 	return held_property(node) != nullptr;
@@ -314,10 +322,17 @@ void AniAttach::hook_scene()
 		return;
 	}
 	hooked_ = true;
+	// Only the nodes that are added or removed are looked at, never the
+	// whole scene (it has a node per bone: hundreds per figure).
 	connect(dzScene, &DzScene::sceneLoaded, this, &AniAttach::schedule_rescan);
-	connect(dzScene, &DzScene::nodeListChanged, this, &AniAttach::schedule_rescan);
+	connect(dzScene, &DzScene::nodeAdded, this, &AniAttach::on_node_added);
+	connect(dzScene, &DzScene::nodeRemoved, this, &AniAttach::on_node_removed);
 	connect(dzScene, &DzScene::sceneCleared, this, [this]() {
 		tracked_.clear();
+		registry_.clear();
+		former_.clear();
+		pending_added_.clear();
+		movers_.clear();
 		pending_bakes_.clear();
 		holders_seen_.clear();
 		for (auto &list : own_connections_)
@@ -379,7 +394,7 @@ void AniAttach::rescan()
 		return;
 	}
 
-	// Forget deleted props.
+	// Forget deleted props (their QPointer went null).
 	for (auto it = own_connections_.begin(); it != own_connections_.end();)
 	{
 		bool alive = false;
@@ -391,33 +406,57 @@ void AniAttach::rescan()
 			for (const auto &c : it.value()) QObject::disconnect(c);
 			for (const auto &c : chain_connections_.value(it.key())) QObject::disconnect(c);
 			chain_connections_.remove(it.key());
+			movers_.remove(it.key());
+			holders_seen_.remove(it.key());
+			registry_.remove(it.key());
 			it = own_connections_.erase(it);
 		}
 		else
 			++it;
 	}
 	tracked_.removeAll(QPointer<DzNode>());
-	// Props that lost Held By (e.g. Undo of a pick-up) or left the scene.
-	for (const QPointer<DzNode> &p : QList<QPointer<DzNode>>(tracked_))
-		if (p && (!uses_aniattach(p) || dzScene->findNodeIndex(p) < 0))
-			untrack(p);
-	for (auto it = holders_seen_.begin(); it != holders_seen_.end();)
+	former_.removeAll(QPointer<DzNode>());
+
+	// What to look at: the registry, props that left it (Undo/Redo can bring
+	// them back) and the nodes added since the last rescan. Only once, when
+	// the plugin starts with a scene already open, the whole scene.
+	QList<DzNode*> candidates;
+	auto add = [&](DzNode *n) {
+		if (n && !qobject_cast<DzBone*>(n) && !candidates.contains(n))
+			candidates.append(n);
+	};
+	for (const QPointer<DzNode> &p : tracked_) add(p);
+	for (const QPointer<DzNode> &p : former_) add(p);
+	for (const QPointer<DzNode> &p : pending_added_) add(p);
+	pending_added_.clear();
+	if (!initial_scan_done_)
 	{
-		bool alive = false;
-		for (const QPointer<DzNode> &p : tracked_)
-			if (p == it.key())
-				alive = true;
-		if (alive)
-			++it;
-		else
-			it = holders_seen_.erase(it);
+		initial_scan_done_ = true;
+		DzNodeListIterator nli = dzScene->nodeListIterator();
+		while (nli.hasNext())
+			add(nli.next());
 	}
 
-	DzNodeListIterator nli = dzScene->nodeListIterator();
-	while (nli.hasNext())
+	const int known = tracked_.size() + former_.size(); // first in `candidates`
+	for (int i = 0; i < candidates.size(); ++i)
 	{
-		DzNode *node = nli.next();
-		if (uses_aniattach(node))
+		DzNode *node = candidates.at(i);
+		// Registered or former props may have been deleted from the scene
+		// (a short list); added and startup nodes are in it.
+		const bool in_scene = i >= known || dzScene->findNodeIndex(node) >= 0;
+		const bool uses = in_scene && uses_aniattach(node);
+		if (!uses)
+		{
+			// Lost Held By (e.g. Undo of a pick-up) or left the scene.
+			if (is_registered(node))
+			{
+				untrack(node);
+				if (!former_.contains(QPointer<DzNode>(node)))
+					former_.append(node);
+			}
+			continue;
+		}
+		former_.removeAll(QPointer<DzNode>(node));
 		{
 			track(node);
 			watch_chains(node);
@@ -438,6 +477,24 @@ void AniAttach::rescan()
 		}
 	}
 	notify();
+}
+
+void AniAttach::on_node_added(DzNode *node)
+{
+	// Bones are never props: skip them before anything else (a figure adds
+	// hundreds). The rest is checked once, after loading has finished.
+	if (!node || qobject_cast<DzBone*>(node))
+		return;
+	pending_added_.append(node);
+	schedule_rescan();
+}
+
+void AniAttach::on_node_removed(DzNode *node)
+{
+	// Only matters if AniAttach is in use: a removed prop, holder or table.
+	if (!node || tracked_.isEmpty())
+		return;
+	schedule_rescan();
 }
 
 void AniAttach::detach_removed(DzNode *prop)
@@ -466,6 +523,9 @@ void AniAttach::detach_removed(DzNode *prop)
 	}
 	for (int slot = target_count(prop); slot >= 1; --slot)
 		prop->removeProperty(target_property(prop, slot));
+	if (DzProperty *mark = prop->findProperty(prop_mark))
+		prop->removeProperty(mark);
+	former_.append(prop); // Undo brings it back
 	baking_ = false;
 	dzUndoStack->accept("AniAttach Remove");
 	notify();
@@ -473,10 +533,11 @@ void AniAttach::detach_removed(DzNode *prop)
 
 void AniAttach::track(DzNode *prop)
 {
-	for (const QPointer<DzNode> &p : tracked_)
-		if (p == prop)
-			return;
+	if (registry_.contains(prop))
+		return;
 	tracked_.append(prop);
+	registry_.insert(prop);
+	former_.removeAll(QPointer<DzNode>(prop));
 
 	QList<QMetaObject::Connection> &conns = own_connections_[prop];
 	QPointer<DzNode> guard(prop);
@@ -527,20 +588,25 @@ void AniAttach::untrack(DzNode *prop)
 	for (const auto &c : own_connections_.take(prop)) QObject::disconnect(c);
 	for (const auto &c : chain_connections_.take(prop)) QObject::disconnect(c);
 	tracked_.removeAll(QPointer<DzNode>(prop));
+	registry_.remove(prop);
+	movers_.remove(prop);
 	pending_bakes_.removeAll(QPointer<DzNode>(prop));
 	holders_seen_.remove(prop);
 }
 
-void AniAttach::watch_chains(DzNode *prop)
+bool AniAttach::is_registered(const DzNode *node) const
 {
-	for (const auto &c : chain_connections_.take(prop)) QObject::disconnect(c);
+	return node && registry_.contains(node);
+}
+
+// Holders and their parents (a hand moves with the arm and the figure),
+// and the carrier's parents (e.g. a table that is moved).
+QList<DzNode*> AniAttach::movers_of(DzNode *prop) const
+{
+	QList<DzNode*> movers;
 	DzNode *carrier = carrier_of(prop);
 	if (!carrier)
-		return;
-
-	// Holders and their parents (a hand moves with the arm and the figure),
-	// and the carrier's parents (e.g. a table that is moved).
-	QList<DzNode*> movers;
+		return movers;
 	auto add_chain = [&](DzNode *n) {
 		for (; n; n = n->getNodeParent())
 			if (n != carrier && n != prop && !movers.contains(n))
@@ -549,15 +615,44 @@ void AniAttach::watch_chains(DzNode *prop)
 	for (int slot = 1; slot <= target_count(prop); ++slot)
 		add_chain(target_node(prop, slot));
 	add_chain(carrier->getNodeParent());
+	return movers;
+}
+
+void AniAttach::watch_chains(DzNode *prop)
+{
+	// Rewire only when the chain changed (a holder added, swapped or gone,
+	// the prop moved under something else): a hand's chain is a dozen bones
+	// with ten channels each.
+	const QList<DzNode*> movers = movers_of(prop);
+	if (chain_connections_.contains(prop) && movers_.value(prop) == movers)
+		return;
+	for (const auto &c : chain_connections_.take(prop)) QObject::disconnect(c);
+	movers_.insert(prop, movers);
+	if (movers.isEmpty() && !carrier_of(prop))
+		return;
+
+	// The channels themselves, and what drives them: keying a pose control
+	// ("Arms Up-Down") moves the arm without any signal on the bone.
+	QSet<DzProperty*> watched;
+	std::function<void(DzProperty*, int)> add = [&](DzProperty *p, int depth) {
+		if (!p || depth > 8 || watched.contains(p))
+			return;
+		watched.insert(p);
+		for (int i = 0; i < p->getNumControllers(); ++i)
+			if (const auto *link = qobject_cast<const DzERCLink*>(p->getController(i)))
+				add(link->getProperty(), depth + 1);
+	};
+	for (DzNode *n : movers)
+		for (DzProperty *p : placement_controls(n))
+			add(p, 0);
 
 	QList<QMetaObject::Connection> &conns = chain_connections_[prop];
 	QPointer<DzNode> guard(prop);
-	for (DzNode *n : movers)
-		for (DzProperty *p : placement_controls(n))
-			conns << connect(p, &DzProperty::valueChanged, this, [this, guard]() {
-				if (guard && !baking_)
-					schedule_bake(guard);
-			});
+	for (DzProperty *p : watched)
+		conns << connect(p, &DzProperty::valueChanged, this, [this, guard]() {
+			if (guard && !baking_)
+				schedule_bake(guard);
+		});
 }
 
 QList<DzNode*> AniAttach::props() const
@@ -565,13 +660,9 @@ QList<DzNode*> AniAttach::props() const
 	QList<DzNode*> list;
 	if (!scene_usable())
 		return list;
-	DzNodeListIterator nli = dzScene->nodeListIterator();
-	while (nli.hasNext())
-	{
-		DzNode *node = nli.next();
-		if (uses_aniattach(node))
-			list.append(node);
-	}
+	for (const QPointer<DzNode> &p : tracked_)
+		if (p)
+			list.append(p);
 	return list;
 }
 
@@ -587,6 +678,7 @@ DzEnumProperty *AniAttach::ensure_setup(DzNode *prop)
 		prop->addProperty(held);
 		held->setValue(0);
 	}
+	ensure_tag(prop);
 
 	if (!carrier_of(prop))
 	{
@@ -669,6 +761,20 @@ void AniAttach::update_items(DzNode *prop)
 		held->setItems(items);
 }
 
+// The saved tag: this node is an AniAttach prop. Props from 1.0/1.1 scenes
+// get it at their next edit (not on load: that would mark the scene as
+// changed just by opening it).
+void AniAttach::ensure_tag(DzNode *prop)
+{
+	if (!prop || prop->findProperty(prop_mark))
+		return;
+	auto mark = new DzBoolProperty(prop_mark, false, true, true);
+	mark->setLabel("AniAttach Prop");
+	mark->setPath(c_group);
+	mark->setHidden(true);
+	prop->addProperty(mark);
+}
+
 // ---------------------------------------------------------------------------
 // editing
 
@@ -717,6 +823,7 @@ bool AniAttach::release(DzNode *prop, DzTime time)
 		return false;
 	dzUndoStack->beginHold();
 	baking_ = true;
+	ensure_tag(prop);
 	key_held(held, time, 0);
 	baking_ = false;
 	bake_now(prop);
@@ -732,6 +839,7 @@ bool AniAttach::clear(DzNode *prop)
 		return false;
 	dzUndoStack->beginHold();
 	baking_ = true;
+	ensure_tag(prop);
 	held->deleteAllKeys();
 	held->setValue(0);
 	baking_ = false;
@@ -765,7 +873,10 @@ bool AniAttach::remove(DzNode *prop)
 	}
 	for (int slot = target_count(prop); slot >= 1; --slot)
 		prop->removeProperty(target_property(prop, slot));
+	if (DzProperty *mark = prop->findProperty(prop_mark))
+		prop->removeProperty(mark);
 	prop->removeProperty(held);
+	former_.append(prop); // Undo brings it back
 	dzUndoStack->accept("AniAttach Remove");
 	notify();
 	return true;
@@ -781,6 +892,7 @@ bool AniAttach::set_key_slot(DzNode *prop, int index, int slot)
 		return true;
 	dzUndoStack->beginHold();
 	baking_ = true;
+	ensure_tag(prop);
 	held->setKeyValue(index, slot);
 	baking_ = false;
 	bake_now(prop);
@@ -796,6 +908,7 @@ bool AniAttach::delete_key(DzNode *prop, int index)
 		return false;
 	dzUndoStack->beginHold();
 	baking_ = true;
+	ensure_tag(prop);
 	held->deleteKeys(index, index);
 	if (held->getNumKeys() == 0)
 		held->setValue(0);
@@ -920,6 +1033,48 @@ bool AniAttach::bake_now(DzNode *prop)
 	DzTime start, end, step;
 	anim_range(start, end, step);
 	DzNode *parent = carrier->getNodeParent();
+	const DzTime original_time = dzScene->getTime();
+
+	// Fast path: read every transform at its frame (getWSTransform(t)).
+	// Daz does not evaluate controllers (pose controls through ERC, aniBlocks,
+	// formulas) for such reads, so when something that moves the holders or
+	// the table is driven like that, move the scene to each frame instead
+	// (slower, always right). Spot checks catch drivers the first test
+	// cannot see.
+	bool stepping = driven_by_animation(movers_of(prop));
+	if (!stepping)
+	{
+		auto differs = [](const DzMatrix3 &a, const DzMatrix3 &b) {
+			for (int r = 0; r < 4; ++r)
+				if ((a.row(r) - b.row(r)).length() > 1e-3f)
+					return true;
+			return false;
+		};
+		for (int i = first; i < segs.size() && !stepping; ++i)
+		{
+			const AniAttachSegment &s = segs.at(i);
+			if (s.slot <= 0 || !s.target)
+				continue;
+			const DzTime a = qBound(start, s.start, end);
+			const DzTime b = qBound(start, s.end - step, end);
+			for (DzTime ts : { a, start + ((a + b) / 2 - start) / step * step, b })
+			{
+				const DzMatrix3 at_time = s.target->getWSTransform(ts);
+				dzScene->setTime(ts);
+				if (differs(at_time, s.target->getWSTransform()))
+				{
+					stepping = true;
+					break;
+				}
+			}
+		}
+		if (dzScene->getTime() != original_time)
+			dzScene->setTime(original_time);
+	}
+	// A node's world transform at t, the fast or the slow way.
+	auto ws = [&](const DzNode *n, DzTime at) {
+		return stepping ? n->getWSTransform() : n->getWSTransform(at);
+	};
 
 	const DzTime t0 = segs.at(first).start;
 	DzTime t = t0 > start ? t0 - step : start;
@@ -938,7 +1093,9 @@ bool AniAttach::bake_now(DzNode *prop)
 	// moving the scene there: setTime() makes Daz evaluate the whole scene
 	// (every figure, the viewport, other plugins) for each frame, which made
 	// one bake of a 300-frame scene take seconds.
-	DzMatrix3 prev = carrier->getWSTransform(t);
+	if (stepping)
+		dzScene->setTime(t);
+	DzMatrix3 prev = ws(carrier, t);
 	if (t < t0)
 		t += step;
 
@@ -957,6 +1114,8 @@ bool AniAttach::bake_now(DzNode *prop)
 
 	for (; t <= end; t += step)
 	{
+		if (stepping)
+			dzScene->setTime(t);
 		while (seg_index + 1 < segs.size() && segs.at(seg_index + 1).start <= t)
 			++seg_index;
 		const AniAttachSegment &seg = segs.at(seg_index);
@@ -970,7 +1129,7 @@ bool AniAttach::bake_now(DzNode *prop)
 			{
 				// Picked up (or handed over): keep where it is relative to
 				// the new holder.
-				grip = prev * target->getWSTransform(t).inverse();
+				grip = prev * ws(target, t).inverse();
 				holder = target;
 				mode = Held;
 			}
@@ -983,9 +1142,9 @@ bool AniAttach::bake_now(DzNode *prop)
 
 		DzMatrix3 world;
 		bool write = true;
-		const DzMatrix3 parent_now = parent ? parent->getWSTransform(t) : DzMatrix3(true);
+		const DzMatrix3 parent_now = parent ? ws(parent, t) : DzMatrix3(true);
 		if (mode == Held)
-			world = grip * holder->getWSTransform(t);
+			world = grip * ws(holder, t);
 		else
 		{
 			world = placed;
@@ -1021,8 +1180,47 @@ bool AniAttach::bake_now(DzNode *prop)
 		}
 	}
 
+	if (dzScene->getTime() != original_time)
+		dzScene->setTime(original_time);
 	baking_ = false;
 	watch_chains(prop);
 	notify();
 	return true;
+}
+
+namespace {
+
+// Is `p` driven, through its controllers, by something animated? ERC links
+// are followed to their source properties (a bone is driven by "Arms Up
+// Right", which is driven by "Arms Up-Down Right", which has keys). Any
+// other kind of controller counts as animated: it cannot be checked.
+bool driven(const DzProperty *p, int depth, QSet<const DzProperty*> &seen)
+{
+	if (!p || depth > 8 || seen.contains(p))
+		return false;
+	seen.insert(p);
+	for (int i = 0; i < p->getNumControllers(); ++i)
+	{
+		const auto *link = qobject_cast<const DzERCLink*>(p->getController(i));
+		if (!link)
+			return true;
+		const DzNumericProperty *src = link->getProperty();
+		if (!src)
+			continue;
+		if (src->getNumKeys() > 1 || driven(src, depth + 1, seen))
+			return true;
+	}
+	return false;
+}
+
+} // namespace
+
+bool AniAttach::driven_by_animation(const QList<DzNode*> &nodes)
+{
+	QSet<const DzProperty*> seen;
+	for (const DzNode *n : nodes)
+		for (const DzProperty *p : placement_controls(n))
+			if (driven(p, 0, seen))
+				return true;
+	return false;
 }
