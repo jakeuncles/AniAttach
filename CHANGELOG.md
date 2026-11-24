@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.2.1
+- Fixed lag and a jumping current frame after moving or editing keys on Daz's Timeline. AniAttach 1.2.0 took any keyed dial behind the holder's arm as animated, and figures often have every dial keyed with the same value ("key all", saved poses). It then recomputed props the slow way, moving the scene through every frame after each key edit. Only dials whose value really changes count now; in a test scene a key move went from stepping through 42 frames to checking 3, with the same, exact result.
+
 ## 1.2.0
 - Less lag while you work: AniAttach no longer looks through every node of the scene (a node per bone, hundreds per figure) after every undoable action anywhere in Daz. AniAttach props are now tagged (a hidden "AniAttach Prop" property, saved with the scene) and kept in a registry; only the nodes a file or a paste adds are checked, once, and bones are skipped. The watchers on a holder's arm are only rewired when a holder changes, not on every update.
 - Fixed props that drifted out of the hand (by up to 40 cm in a test) when the arm is animated with pose controls such as "Arms Up-Down": 1.1's faster updates read positions in a way that ignores pose controls. AniAttach now detects pose-control (and other driven) animation on the holder and uses the exact method there, and spot-checks the fast method everywhere else. Bone-keyed animation keeps the fast path (600 frames: about 20 ms; with pose controls: about 0.5 s).

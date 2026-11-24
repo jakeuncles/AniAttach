@@ -7,7 +7,7 @@
 #
 # Result: build/Release/dsp_aniattach.dll -> copy into <DAZStudio6>/plugins.
 cmake_minimum_required(VERSION 3.21)
-project(aniattach VERSION 1.2.0 LANGUAGES CXX)
+project(aniattach VERSION 1.2.1 LANGUAGES CXX)
 
 set(DAZ_SDK_DIR "" CACHE PATH "Root folder of the Daz Studio 6 SDK (contains include/ and x64/lib/)")
 if(NOT DAZ_SDK_DIR)

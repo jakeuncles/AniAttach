@@ -1034,6 +1034,9 @@ bool AniAttach::bake_now(DzNode *prop)
 	anim_range(start, end, step);
 	DzNode *parent = carrier->getNodeParent();
 	const DzTime original_time = dzScene->getTime();
+	// Note: the scene's signals must NOT be blocked while moving it to other
+	// frames below: Daz then does not re-evaluate the bones for the new
+	// frame, and every read returns the pose of the current frame.
 
 	// Fast path: read every transform at its frame (getWSTransform(t)).
 	// Daz does not evaluate controllers (pose controls through ERC, aniBlocks,
@@ -1190,6 +1193,21 @@ bool AniAttach::bake_now(DzNode *prop)
 
 namespace {
 
+// Does `p` change over time? Keys alone do not say so: "key all" and saved
+// poses key every dial of a figure (shapes, pose controls, characters) with
+// the same value on each key.
+bool changes_over_time(const DzNumericProperty *p)
+{
+	const int n = p->getNumKeys();
+	if (n < 2)
+		return false;
+	const double first = p->getDoubleValue(p->getKeyTime(0));
+	for (int k = 1; k < n; ++k)
+		if (std::fabs(p->getDoubleValue(p->getKeyTime(k)) - first) > 1e-6)
+			return true;
+	return false;
+}
+
 // Is `p` driven, through its controllers, by something animated? ERC links
 // are followed to their source properties (a bone is driven by "Arms Up
 // Right", which is driven by "Arms Up-Down Right", which has keys). Any
@@ -1207,7 +1225,7 @@ bool driven(const DzProperty *p, int depth, QSet<const DzProperty*> &seen)
 		const DzNumericProperty *src = link->getProperty();
 		if (!src)
 			continue;
-		if (src->getNumKeys() > 1 || driven(src, depth + 1, seen))
+		if (changes_over_time(src) || driven(src, depth + 1, seen))
 			return true;
 	}
 	return false;
