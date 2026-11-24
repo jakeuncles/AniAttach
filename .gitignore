@@ -36,3 +36,7 @@ release
 /build/
 /dist/
 /stage/
+
+# stray scene saves (Daz writes .tmp files into its working folder)
+/.tmp
+*.tmp
